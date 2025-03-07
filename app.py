@@ -2,37 +2,23 @@ import os
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import datetime
 import numpy as np
+import tensorflow as tf
+import tensorflow_transform as tft
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from sklearn.preprocessing import MinMaxScaler
 
 # Set up Streamlit app
-st.set_page_config(page_title="Stock Market Data Analysis", layout="wide")
-st.title("📈 Stock Market Data Analysis")
-st.markdown("### A user-friendly dashboard to analyze U.S. stock performance, risk, and trends")
+st.set_page_config(page_title="Stock Market Prediction with LSTM & TFT", layout="wide")
+st.title("📈 Stock Market Prediction using LSTM & TFT")
+st.markdown("### Analyze stock trends and predict future prices with AI")
 
-# Fetch live stock data from Yahoo Finance
-@st.cache_data
-def fetch_stock_list():
-    try:
-        # Fetch list of stocks dynamically from Wikipedia S&P 500 page
-        stock_symbols = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]['Symbol'].tolist()
-        return pd.DataFrame({"Ticker": stock_symbols})
-    except Exception as e:
-        st.error(f"Error fetching stock data: {e}")
-        return pd.DataFrame()
+# Sidebar - User Selection
+stock_symbol = st.sidebar.text_input("Enter Stock Ticker (e.g., AAPL, TSLA)", "AAPL")
+time_period = st.sidebar.selectbox("Select Time Range", ["1y", "5y", "10y", "max"])
 
-stock_list = fetch_stock_list()
-if stock_list.empty:
-    st.error("⚠️ No stock data available.")
-    st.stop()
-
-# Sidebar for user selection
-time_range = st.sidebar.selectbox("Select Time Range", ["1y", "5y", "10y", "max"])
-selected_stock = st.sidebar.selectbox("Choose a Stock", stock_list["Ticker"].unique())
-
-# Fetch historical data for selected stock
+# Fetch stock data
 @st.cache_data
 def get_stock_data(ticker, period):
     try:
@@ -44,81 +30,72 @@ def get_stock_data(ticker, period):
         st.error(f"Error fetching stock data: {e}")
         return pd.DataFrame()
 
-stock_data = get_stock_data(selected_stock, time_range)
+stock_data = get_stock_data(stock_symbol, time_period)
+
 if stock_data.empty:
     st.warning("⚠️ No data available for the selected stock.")
     st.stop()
 
-# Display stock chart
-if not stock_data.empty:
-    st.subheader(f"📊 {selected_stock} Stock Performance")
-    fig = px.line(stock_data, x=stock_data.index, y='Close', title=f"{selected_stock} Closing Prices")
-    st.plotly_chart(fig)
+st.subheader(f"📊 {stock_symbol} Stock Performance")
+st.line_chart(stock_data['Close'])
 
-    # Compute Technical Indicators
-    stock_data['SMA_50'] = stock_data['Close'].rolling(window=50).mean()
-    stock_data['SMA_200'] = stock_data['Close'].rolling(window=200).mean()
-    stock_data['Volatility'] = stock_data['Close'].pct_change().rolling(20).std()
+# ---------------------------------- TFT PREPROCESSING ----------------------------------
 
-    # Exponential Moving Averages (EMA)
-    stock_data['EMA_12'] = stock_data['Close'].ewm(span=12, adjust=False).mean()
-    stock_data['EMA_26'] = stock_data['Close'].ewm(span=26, adjust=False).mean()
-    stock_data['EMA_20'] = stock_data['Close'].ewm(span=20, adjust=False).mean()
-    stock_data['EMA_50'] = stock_data['Close'].ewm(span=50, adjust=False).mean()
+# Function to apply TFT transformation
+def preprocessing_fn(inputs):
+    outputs = {}
+    outputs['Close_normalized'] = tft.scale_to_z_score(inputs['Close'])
+    return outputs
 
-    # Bollinger Bands
-    stock_data['Middle Band'] = stock_data['Close'].rolling(window=20).mean()
-    stock_data['Upper Band'] = stock_data['Middle Band'] + (stock_data['Close'].rolling(window=20).std() * 2)
-    stock_data['Lower Band'] = stock_data['Middle Band'] - (stock_data['Close'].rolling(window=20).std() * 2)
+# Apply TFT preprocessing
+def apply_tft_transformation(stock_data):
+    raw_data = {'Close': stock_data['Close'].values.astype(np.float32)}
+    transformed_data = preprocessing_fn(raw_data)
+    return transformed_data
 
-    # Moving Average Convergence Divergence (MACD)
-    stock_data['MACD'] = stock_data['EMA_12'] - stock_data['EMA_26']
-    stock_data['Signal Line'] = stock_data['MACD'].ewm(span=9, adjust=False).mean()
+tft_data = apply_tft_transformation(stock_data)
 
-    # Relative Strength Index (RSI)
-    avg_gain = stock_data['Close'].diff().where(stock_data['Close'].diff() > 0, 0).rolling(14).mean().fillna(0)
-    avg_loss = -stock_data['Close'].diff().where(stock_data['Close'].diff() < 0, 0).rolling(14).mean().fillna(0)
-    avg_loss = avg_loss.replace(0, 1e-6)
-    rs = avg_gain / avg_loss.fillna(1)
-    stock_data['RSI'] = 100 - (100 / (1 + rs))
+# ----------------------------- LSTM MODEL TRAINING ------------------------------------
 
-# AI-Based Stock Recommendations
-st.subheader("📊 AI-Based Stock Recommendation")
+# Prepare data for LSTM
+def prepare_data(data, look_back=60):
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_data = scaler.fit_transform(data['Close'].values.reshape(-1, 1))
 
-def stock_recommendation(stock_data):
-    try:
-        if stock_data.empty:
-            return "⚠️ No Data Available"
-        latest_rsi = stock_data['RSI'].iloc[-1]
-        latest_macd = stock_data['MACD'].iloc[-1]
-        latest_signal = stock_data['Signal Line'].iloc[-1]
-        latest_volatility = stock_data['Volatility'].iloc[-1]
-        latest_sma_50 = stock_data['SMA_50'].iloc[-1]
-        latest_sma_200 = stock_data['SMA_200'].iloc[-1]
+    X, y = [], []
+    for i in range(look_back, len(scaled_data)):
+        X.append(scaled_data[i - look_back:i, 0])
+        y.append(scaled_data[i, 0])
 
-        previous_sma_50 = stock_data['SMA_50'].iloc[-2]
-        previous_sma_200 = stock_data['SMA_200'].iloc[-2]
-        golden_cross = previous_sma_50 < previous_sma_200 and latest_sma_50 > latest_sma_200
-        death_cross = previous_sma_50 > previous_sma_200 and latest_sma_50 < latest_sma_200
-        macd_histogram = latest_macd - latest_signal
+    X, y = np.array(X), np.array(y)
+    X = np.reshape(X, (X.shape[0], X.shape[1], 1))
+    return X, y, scaler
 
-        if latest_rsi > 70 and latest_macd < latest_signal and death_cross:
-            return "📉 Strong Sell - Overbought, Bearish MACD & Death Cross"
-        elif latest_rsi < 30 and latest_macd > latest_signal and golden_cross:
-            return "📈 Strong Buy - Oversold, Bullish MACD & Golden Cross"
-        elif macd_histogram > 0 and latest_sma_50 > latest_sma_200:
-            return "📈 Buy - Bullish MACD & Uptrend"
-        elif macd_histogram < 0 and latest_sma_50 < latest_sma_200:
-            return "📉 Sell - Bearish MACD & Downtrend"
-        elif latest_volatility > stock_data['Volatility'].quantile(0.75):
-            return "⚠️ Hold - High Volatility Detected"
-        else:
-            return "🔄 Hold - Weak or No Strong Signal"
-    except Exception as e:
-        return f"Error in recommendation: {e}"
+X, y, scaler = prepare_data(stock_data)
 
-if not stock_data.empty:
-    recommendation = stock_recommendation(stock_data)
-    st.markdown(
-        f"<div style='padding:10px; border-radius:5px; background-color:#2e86c1; color:white; font-size:18px; font-weight:bold;'>{recommendation}</div>",
-        unsafe_allow_html=True)
+# Build LSTM model
+def build_lstm_model(input_shape):
+    model = Sequential([
+        LSTM(50, return_sequences=True, input_shape=input_shape),
+        LSTM(50, return_sequences=False),
+        Dense(25),
+        Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='mean_squared_error')
+    return model
+
+# Train the LSTM model
+model = build_lstm_model((X.shape[1], 1))
+model.fit(X, y, epochs=10, batch_size=32, verbose=1)
+
+# Predict future stock price
+def predict_price(model, scaler, stock_data, look_back=60):
+    inputs = stock_data['Close'].tail(look_back).values.reshape(-1, 1)
+    inputs = scaler.transform(inputs)
+    inputs = np.reshape(inputs, (1, look_back, 1))
+    predicted_price = model.predict(inputs)
+    return scaler.inverse_transform(predicted_price)[0][0]
+
+predicted_price = predict_price(model, scaler, stock_data)
+
+st.subheader(f"🔮 Predicted Closing Price for Next Day: ${predicted_price:.2f}")
